@@ -7,3 +7,5 @@ The documentation is available at: https://www.sberbank.com/ru/certificates
 Also you can use https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer
 
 In this plugin, I use russian_trusted_root_ca.cer
+
+Path to the certificate: certs/russian_trusted_root_ca.cer. Just put "russian_trusted_root_ca.cer" file into "certs" directory.
