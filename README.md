@@ -5,3 +5,5 @@ To interact with PS services, you need to install the NUC certificate of the Min
 The documentation is available at: https://www.sberbank.com/ru/certificates
 
 Also you can use https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer
+
+In this plugin, I use russian_trusted_root_ca.cer
