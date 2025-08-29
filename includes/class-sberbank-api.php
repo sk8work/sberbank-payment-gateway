@@ -10,125 +10,295 @@ class Sberbank_API {
     public function __construct($gateway) {
         $this->gateway = $gateway;
     }
-    
+
+    /**
+     * Регистрация заказа в платежном шлюзе Сбербанка
+     *
+     * @param WC_Order $order Объект заказа WooCommerce
+     * @return array Ответ от API Сбербанка
+     * @throws Exception
+     */
     public function register_order($order) {
-        $order_id       = $order->get_id();
-        $amount         = $order->get_total();
-        $currency       = $order->get_currency();
-        $description    = sprintf(__('Оплата заказа №%s', 'sberbank-payment-gateway'), $order_id);
+        $order_id = $order->get_id();
+        $amount = $order->get_total();
+        $currency = $order->get_currency();
         
         $request_data = array(
             'userName'      => $this->gateway->merchant_login,
             'password'      => $this->gateway->merchant_password,
-            'orderNumber'   => $order_id . '_' . time(),
-            'amount'        => $amount * 100, // Сумма в копейках
+            'orderNumber'   => $this->generate_order_number($order_id),
+            'amount'        => $this->format_amount($amount),
             'currency'      => $this->get_currency_code($currency),
             'returnUrl'     => $this->gateway->get_return_url($order),
             'failUrl'       => $order->get_cancel_order_url(),
-            'description'   => $description,
+            'description'   => $this->get_order_description($order_id),
             'language'      => 'ru',
+            'email'         => sanitize_email($order->get_billing_email()),
+            'phone'         => $this->format_phone($order->get_billing_phone()),
+            'orderBundle'   => $this->get_order_bundle($order)
         );
-        
-        // Добавляем данные для ФФД, если включено
-        if ($this->gateway->ffd_version) {
-            $request_data = $this->add_ffd_data($request_data, $order);
-        }
-        
-        // Добавляем данные покупателя
-        $request_data['email'] = $order->get_billing_email();
-        $request_data['phone'] = preg_replace('/[^0-9]/', '', $order->get_billing_phone());
-        
-        $method     = $this->gateway->two_stage ? 'registerPreAuth.do' : 'register.do';
-        $response   = $this->send_request($method, $request_data);
-        
+
+        $response = $this->send_request('register.do', $request_data);
+
         if ($response['errorCode'] == 0) {
-            // Сохраняем ID платежа в метаданные заказа
             $order->update_meta_data('_sberbank_order_id', $response['orderId']);
             $order->save();
         }
-        
+
         return $response;
     }
-    
+
+    /**
+     * Проверка статуса заказа в платежном шлюзе
+     *
+     * @param int $order_id ID заказа WooCommerce
+     * @return array Ответ от API Сбербанка
+     * @throws Exception
+     */
+    public function get_order_status($order_id) {
+        $order = wc_get_order($order_id);
+        $sberbank_order_id = $order->get_meta('_sberbank_order_id');
+        
+        if (!$sberbank_order_id) {
+            throw new Exception(__('ID заказа Сбербанка не найден', 'sberbank-payment-gateway'));
+        }
+        
+        $request_data = array(
+            'userName'  => $this->gateway->merchant_login,
+            'password'  => $this->gateway->merchant_password,
+            'orderId'   => $sberbank_order_id
+        );
+
+        return $this->send_request('getOrderStatusExtended.do', $request_data);
+    }
+
+    /**
+     * Возврат средств по заказу
+     *
+     * @param WC_Order $order Объект заказа WooCommerce
+     * @param float $amount Сумма возврата
+     * @return array Ответ от API Сбербанка
+     * @throws Exception
+     */
     public function refund_order($order, $amount) {
         $sberbank_order_id = $order->get_meta('_sberbank_order_id');
         
         if (!$sberbank_order_id) {
-            throw new Exception(__('ID заказа в Сбербанке не найден', 'sberbank-payment-gateway'));
+            throw new Exception(__('ID заказа Сбербанка не найден', 'sberbank-payment-gateway'));
         }
         
         $request_data = array(
             'userName'  => $this->gateway->merchant_login,
             'password'  => $this->gateway->merchant_password,
             'orderId'   => $sberbank_order_id,
-            'amount'    => $amount * 100, // Сумма в копейках
+            'amount'    => $this->format_amount($amount)
         );
-        
-        // Добавляем данные для ФФД, если включено
-        if ($this->gateway->ffd_version) {
-            $request_data = $this->add_ffd_refund_data($request_data, $order, $amount);
-        }
-        
+
         return $this->send_request('refund.do', $request_data);
     }
-    
-    public function get_order_status($order) {
-        $sberbank_order_id = $order->get_meta('_sberbank_order_id');
+
+    /**
+     * Отправка запроса к API Сбербанка
+     *
+     * @param string $endpoint Конечная точка API
+     * @param array $data Данные запроса
+     * @return array Ответ от API
+     * @throws Exception
+     */
+    private function send_request($endpoint, $data) {
+        $url = $this->gateway->api_url . $endpoint;
+
+        // Путь к сертификату
+        $cert_path = SBERBANK_PAYMENT_GATEWAY_PLUGIN_DIR . 'certs/russian_trusted_root_ca.cer';
         
-        if (!$sberbank_order_id) {
-            throw new Exception(__('ID заказа в Сбербанке не найден', 'sberbank-payment-gateway'));
+        $args = array(
+            'body'      => json_encode($data, JSON_UNESCAPED_UNICODE),
+            'headers'   => array(
+                'Content-Type'  => 'application/json',
+                'Accept'        => 'application/json'
+            ),
+            'timeout'   => 30,
+            'sslverify' => $this->gateway->get_option('ssl_verify') === 'yes'
+        );
+
+        // Добавляем путь к CA-сертификату если проверка SSL включена и файл существует
+        if ($this->gateway->get_option('ssl_verify') === 'yes' && file_exists($cert_path)) {
+            $args['sslcertificates'] = $cert_path;
+        }
+
+        $response = wp_remote_post($url, $args);
+
+        if (is_wp_error($response)) {
+            throw new Exception(__('Ошибка соединения с платежным шлюзом: ', 'sberbank-payment-gateway') . $response->get_error_message());
+        }
+
+        $response_code  = wp_remote_retrieve_response_code($response);
+        $response_body  = wp_remote_retrieve_body($response);
+        $result         = json_decode($response_body, true);
+
+        if ($this->gateway->logging) {
+            $this->log_request($endpoint, $data, $result, $response_code);
+        }
+
+        if ($response_code != 200) {
+            throw new Exception(__('Сервер платежного шлюза вернул ошибку: HTTP ', 'sberbank-payment-gateway') . $response_code);
+        }
+
+        if (!$result || !isset($result['errorCode'])) {
+            throw new Exception(__('Неверный формат ответа от платежного шлюза', 'sberbank-payment-gateway'));
+        }
+
+        if ($result['errorCode'] != 0) {
+            $error_message = isset($result['errorMessage']) ? $result['errorMessage'] : __('Неизвестная ошибка платежного шлюза', 'sberbank-payment-gateway');
+            throw new Exception($error_message);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Генерация номера заказа для платежного шлюза
+     *
+     * @param int $order_id ID заказа WooCommerce
+     * @return string Уникальный номер заказа
+     */
+    private function generate_order_number($order_id) {
+        return $order_id . '_' . time() . '_' . wp_rand(1000, 9999);
+    }
+
+    /**
+     * Форматирование суммы для платежного шлюза (в копейках)
+     *
+     * @param float $amount Сумма
+     * @return int Сумма в минимальных единицах валюты
+     */
+    private function format_amount($amount) {
+        return (int)round($amount * 100);
+    }
+
+    /**
+     * Получение кода валюты по ISO 4217
+     *
+     * @param string $currency Валюта (RUB, USD, EUR)
+     * @return int Код валюты
+     */
+    private function get_currency_code($currency) {
+        $currencies = array(
+            'RUB' => 643,
+            'USD' => 840,
+            'EUR' => 978,
+            'BYN' => 933,
+            'KZT' => 398,
+            'UAH' => 980,
+            'CNY' => 156,
+            'GBP' => 826,
+            'JPY' => 392
+        );
+        return isset($currencies[$currency]) ? $currencies[$currency] : 643;
+    }
+
+    /**
+     * Формирование описания заказа
+     *
+     * @param int $order_id ID заказа WooCommerce
+     * @return string Описание заказа
+     */
+    private function get_order_description($order_id) {
+        $description = sprintf(__('Оплата заказа №%s', 'sberbank-payment-gateway'), $order_id);
+        
+        // Ограничиваем длину описания (максимум 512 символов по API)
+        if (mb_strlen($description) > 512) {
+            $description = mb_substr($description, 0, 509) . '...';
         }
         
-        $request_data = array(
-            'userName'  => $this->gateway->merchant_login,
-            'password'  => $this->gateway->merchant_password,
-            'orderId'   => $sberbank_order_id,
-        );
-        
-        return $this->send_request('getOrderStatusExtended.do', $request_data);
+        return $description;
     }
-    
-    private function add_ffd_data($request_data, $order) {
-        $items          = array();
-        $total_amount   = 0;
+
+    /**
+     * Форматирование номера телефона
+     *
+     * @param string $phone Номер телефона
+     * @return string Отформатированный номер
+     */
+    private function format_phone($phone) {
+        if (empty($phone)) {
+            return '';
+        }
         
+        $phone = preg_replace('/[^0-9+]/', '', $phone);
+        
+        // Если номер начинается с 8, заменяем на +7
+        if (substr($phone, 0, 1) === '8' && strlen($phone) === 11) {
+            $phone = '+7' . substr($phone, 1);
+        }
+        // Если номер без кода страны, добавляем +7
+        elseif (substr($phone, 0, 1) !== '+' && strlen($phone) === 10) {
+            $phone = '+7' . $phone;
+        }
+        
+        return substr($phone, 0, 16);
+    }
+
+    /**
+     * Формирование данных корзины для фискализации
+     *
+     * @param WC_Order $order Объект заказа WooCommerce
+     * @return array Данные корзины
+     */
+    private function get_order_bundle($order) {
+        // Если фискализация отключена, возвращаем пустой массив
+        if ($this->gateway->get_option('ffd_enabled') !== 'yes') {
+            return array();
+        }
+
+        $items = array();
+        $total_amount = 0;
+
         // Товары в заказе
         foreach ($order->get_items() as $item_id => $item) {
-            $product    = $item->get_product();
-            $tax_rate   = $this->get_tax_rate_for_product($product);
+            $product = $item->get_product();
+            
+            if (!$product) {
+                continue;
+            }
+            
+            $tax_rate = $this->get_tax_rate_for_product($product);
+            $quantity = $item->get_quantity();
+            $item_total = $item->get_total();
+            $item_price = $quantity > 0 ? $item_total / $quantity : 0;
             
             $item_data = array(
                 'positionId'    => $item_id,
-                'name'          => $item->get_name(),
+                'name'          => $this->sanitize_item_name($item->get_name()),
                 'quantity'      => array(
-                    'value'     => $item->get_quantity(),
-                    'measure'   => $this->get_measure_code($product),
+                    'value'     => $quantity,
                 ),
-                'itemAmount'    => $item->get_total() * 100,
-                'itemPrice'     => $item->get_subtotal() / $item->get_quantity() * 100,
+                'measurementUnit'   => $this->get_measure_code($product),
+                'itemAmount'    => $this->format_amount($item_total),
+                'itemPrice'     => $this->format_amount($item_price),
                 'itemCode'      => $product->get_id(),
                 'tax'           => array(
-                    'taxType' => $this->get_tax_code($tax_rate),
+                    'taxType'   => $this->get_tax_code($tax_rate),
                 ),
                 'paymentMethod' => 'full_payment',
                 'paymentObject' => $this->get_payment_object($product),
             );
             
             $items[] = $item_data;
-            $total_amount += $item->get_total();
+            $total_amount += $item_total;
         }
-        
+
         // Доставка
         if ($order->get_shipping_total() > 0) {
             $shipping_item = array(
-                'positionId'    => 'delivery_' . $order->get_shipping_method(),
+                'positionId'    => 'delivery_' . sanitize_title($order->get_shipping_method()),
                 'name'          => __('Доставка', 'sberbank-payment-gateway'),
                 'quantity'      => array(
                     'value'     => 1,
-                    'measure'   => '0',
                 ),
-                'itemAmount'    => $order->get_shipping_total() * 100,
-                'itemPrice'     => $order->get_shipping_total() * 100,
+                'measurementUnit'   => $this->get_measure_code(null),
+                'itemAmount'    => $this->format_amount($order->get_shipping_total()),
+                'itemPrice'     => $this->format_amount($order->get_shipping_total()),
                 'itemCode'      => 'delivery',
                 'tax'           => array(
                     'taxType'   => $this->get_tax_code($this->gateway->tax_system == 'osn' ? 20 : 0),
@@ -140,136 +310,75 @@ class Sberbank_API {
             $items[] = $shipping_item;
             $total_amount += $order->get_shipping_total();
         }
-        
+
         // Скидки
-        if ($order->get_discount_total() > 0) {
-            // Распределяем скидку пропорционально между товарами
-            $discount_per_item = $order->get_discount_total() / count($items);
+        if ($order->get_discount_total() > 0 && !empty($items)) {
+            $discount_total = $order->get_discount_total();
+            $discount_per_item = $discount_total / count($items);
             
             foreach ($items as &$item) {
-                $item['itemAmount'] = max(0, $item['itemAmount'] - ($discount_per_item * 100));
-                $item['itemPrice']  = $item['itemAmount'] / ($item['quantity']['value'] * 100);
+                $item_discount = min($discount_per_item, $item['itemAmount'] / 100);
+                $item['itemAmount'] = max(0, $item['itemAmount'] - $this->format_amount($item_discount));
+                
+                if ($item['quantity']['value'] > 0) {
+                    $item['itemPrice'] = $item['itemAmount'] / $item['quantity']['value'];
+                }
             }
         }
-        
-        $request_data['orderBundle'] = array(
-            'orderCreationDate' => date('c'),
-            'customerDetails'   => array(
-                'email' => $order->get_billing_email(),
-                'phone' => preg_replace('/[^0-9]/', '', $order->get_billing_phone()),
+
+        // Формируем orderBundle согласно формату Сбербанка
+        $order_bundle = array(
+            'orderCreationDate' => $order->get_date_created()->date('Y-m-d\TH:i:s'),
+            'customerDetails' => array(
+                'email' => sanitize_email($order->get_billing_email()),
+                'phone' => $this->format_phone($order->get_billing_phone()),
+                'contact' => $order->get_meta('_billing__first_name'),
             ),
+            'total' => $total_amount,
             'cartItems' => array(
-                'items' => $items,
-            ),
-            'ffdVersion'    => $this->gateway->ffd_version,
-            'taxSystem'     => $this->gateway->tax_system,
+                'items' => $items
+            )
         );
-        
-        return $request_data;
-    }
-    
-    private function add_ffd_refund_data($request_data, $order, $amount) {
-        // Для возвратов также нужно передавать данные о товарах
-        $items = array();
-        $total_amount = 0;
-        
-        // Товары в заказе
-        foreach ($order->get_items() as $item_id => $item) {
-            $product    = $item->get_product();
-            $tax_rate   = $this->get_tax_rate_for_product($product);
-            
-            // Распределяем сумму возврата пропорционально стоимости товаров
-            $item_ratio     = $item->get_total() / $order->get_total();
-            $refund_amount  = $amount * $item_ratio;
-            
-            $item_data = array(
-                'positionId'    => $item_id,
-                'name'          => $item->get_name(),
-                'quantity'      => array(
-                    'value'     => $item->get_quantity(),
-                    'measure'   => $this->get_measure_code($product),
+
+        // Добавляем фискальные данные если включена фискализация
+        if ($this->gateway->get_option('ffd_enabled') === 'yes') {
+            $order_bundle = array_merge($order_bundle, array(
+                'ffdVersion' => $this->gateway->ffd_version,
+                'receiptType' => 'sell',
+                'taxationSystem' => $this->get_taxation_system_code($this->gateway->tax_system),
+                'clientInfo' => array(
+                    'email' => $this->gateway->company_email ?: get_option('admin_email'),
                 ),
-                'itemAmount'    => $refund_amount * 100,
-                'itemPrice'     => $item->get_subtotal() / $item->get_quantity() * 100,
-                'itemCode'      => $product->get_id(),
-                'tax'           => array(
-                    'taxType' => $this->get_tax_code($tax_rate),
-                ),
-                'paymentMethod' => 'full_payment',
-                'paymentObject' => $this->get_payment_object($product),
-            );
-            
-            $items[] = $item_data;
+                'companyInfo' => array(
+                    'email' => $this->gateway->company_email ?: get_option('admin_email'),
+                    'sno' => $this->gateway->tax_system,
+                    'inn' => $this->gateway->company_inn,
+                    'paymentAddress' => $this->gateway->payment_address ?: get_site_url()
+                )
+            ));
         }
-        
-        $request_data['orderBundle'] = array(
-            'orderCreationDate' => date('c'),
-            'cartItems' => array(
-                'items' => $items,
-            ),
-            'ffdVersion'    => $this->gateway->ffd_version,
-            'taxSystem'     => $this->gateway->tax_system,
-            'receiptType'   => 'refund',
-        );
-        
-        return $request_data;
+
+        return $order_bundle;
     }
-    
-    private function send_request($method, $data) {
-        $url = $this->gateway->api_url . $method;
-        
-        
-        $args = array(
-            'body'      => json_encode($data, JSON_UNESCAPED_UNICODE),
-            'headers'   => array(
-                'Content-Type' => 'application/json',
-            ),
-            'timeout' => 30,
-        );
-        
-        $response = wp_remote_post($url, $args);
-        
-        if (is_wp_error($response)) {
-            throw new Exception($response->get_error_message());
-        }
-        
-        $response_body  = wp_remote_retrieve_body($response);
-        $result         = json_decode($response_body, true);
-        
-        if ($this->gateway->logging) {
-            $this->log($method, $data, $result);
-        }
-        
-        if (!$result || !isset($result['errorCode'])) {
-            throw new Exception(__('Неверный ответ от сервера Сбербанка', 'sberbank-payment-gateway'));
-        }
-        
-        return $result;
+
+    /**
+     * Санитизация названия товара
+     *
+     * @param string $name Название товара
+     * @return string Очищенное название
+     */
+    private function sanitize_item_name($name) {
+        $name = sanitize_text_field($name);
+        $name = mb_substr($name, 0, 128); // Ограничиваем длину
+        return $name;
     }
-    
-    private function get_currency_code($currency) {
-        $currencies = array(
-            'RUB' => 643,
-            'USD' => 840,
-            'EUR' => 978,
-            'BYN' => 933,
-        );
-        
-        return isset($currencies[$currency]) ? $currencies[$currency] : 643;
-    }
-    
-    private function get_tax_code($tax_rate) {
-        $tax_codes = array(
-            0   => 0,   // без НДС
-            10  => 2,   // НДС 10%
-            20  => 6,   // НДС 20%
-            5   => 8,    // НДС 5%
-            7   => 10,   // НДС 7%
-        );
-        
-        return isset($tax_codes[$tax_rate]) ? $tax_codes[$tax_rate] : 0;
-    }
-    
+
+    /**
+     * Получение ставки НДС для товара
+     *
+     * @param WC_Product $product Объект товара WooCommerce
+     * @return float Ставка НДС
+     */
     private function get_tax_rate_for_product($product) {
         $tax_class = $product->get_tax_class();
         $tax_rates = WC_Tax::get_rates($tax_class);
@@ -279,39 +388,165 @@ class Sberbank_API {
             return $tax_rate['rate'];
         }
         
-        return 0;
-    }
-    
-    private function get_measure_code($product) {
-        if ($this->gateway->ffd_version == '1.2') {
-            // Для ФФД 1.2 используем коды
-            return '0'; // штуки
-        } else {
-            // Для ФФД 1.05 используем названия
-            return 'шт';
+        // Возвращаем ставку по умолчанию в зависимости от системы налогообложения
+        switch ($this->gateway->tax_system) {
+            case 'osn':
+                return 20;
+            case 'usn_income':
+            case 'usn_income_outcome':
+                return 0;
+            default:
+                return 0;
         }
     }
-    
-    private function get_payment_object($product) {
-        if ($this->gateway->ffd_version == '1.2') {
-            // Для ФФД 1.2 используем коды
-            return '1'; // товар
-        } else {
-            // Для ФФД 1.05 используем названия
-            return 'commodity';
-        }
-    }
-    
-    private function log($method, $request, $response) {
-        $log = sprintf(
-            "[%s] Method: %s\nRequest: %s\nResponse: %s\n\n",
-            date('Y-m-d H:i:s'),
-            $method,
-            print_r($request, true),
-            print_r($response, true)
+
+    /**
+     * Получение кода налога для платежного шлюза
+     *
+     * @param float $tax_rate Ставка налога
+     * @return int Код налога
+     */
+    private function get_tax_code($tax_rate) {
+        $tax_codes = array(
+            0   => 6,   // без НДС
+            10  => 2,   // НДС 10%
+            20  => 1,   // НДС 20%
+            18  => 1,   // НДС 18% (старая ставка)
+            5   => 5,   // НДС 5%
+            7   => 7    // НДС 7%
         );
         
-        $log_file = WP_CONTENT_DIR . '/sberbank-payment-gateway.log';
-        file_put_contents($log_file, $log, FILE_APPEND);
+        // Округляем ставку налога
+        $rounded_rate = round($tax_rate);
+        
+        return isset($tax_codes[$rounded_rate]) ? $tax_codes[$rounded_rate] : 6;
+    }
+
+    /**
+     * Получение кода системы налогообложения
+     *
+     * @param string $tax_system Система налогообложения
+     * @return int Код системы налогообложения
+     */
+    private function get_taxation_system_code($tax_system) {
+        $codes = array(
+            'osn'                   => 0,
+            'usn_income'            => 1,
+            'usn_income_outcome'    => 2,
+            'envd'                  => 3,
+            'esn'                   => 4,
+            'patent'                => 5
+        );
+        
+        return isset($codes[$tax_system]) ? $codes[$tax_system] : 0;
+    }
+
+    /**
+     * Получение кода единицы измерения
+     *
+     * @param WC_Product|null $product Объект товара WooCommerce
+     * @return string Код единицы измерения
+     */
+    private function get_measure_code($product) {
+        if ($this->gateway->ffd_version == '1.2') {
+            return 'шт.'; // штуки
+        } else {
+            return 'шт.';
+        }
+    }
+
+    /**
+     * Получение кода объекта платежа
+     *
+     * @param WC_Product $product Объект товара WooCommerce
+     * @return string Код объекта платежа
+     */
+    private function get_payment_object($product) {
+        if ($product->is_downloadable()) {
+            return '4'; // электронный товар
+        } elseif ($product->is_virtual()) {
+            return '4'; // услуга
+        } else {
+            return '1'; // товар
+        }
+    }
+
+    /**
+     * Логирование запросов и ответов
+     *
+     * @param string $endpoint Конечная точка API
+     * @param array $request Данные запроса
+     * @param array $response Ответ от API
+     * @param int $response_code HTTP код ответа
+     */
+    private function log_request($endpoint, $request, $response, $response_code) {
+        $log_data = array(
+            'date'          => current_time('mysql'),
+            'endpoint'      => $endpoint,
+            'request'       => $this->sanitize_log_data($request),
+            'response'      => $this->sanitize_log_data($response),
+            'response_code' => $response_code
+        );
+
+        $log_file = WP_CONTENT_DIR . '/plugins/sberbank-payment-gateway/sberbank-payment-gateway.log';
+        $log_entry = "[" . $log_data['date'] . "] " . $endpoint . " (HTTP " . $response_code . ")\n";
+        $log_entry .= "Request: " . json_encode($log_data['request'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) . "\n";
+        $log_entry .= "Response: " . json_encode($log_data['response'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) . "\n";
+        $log_entry .= "--------------------------------------------------\n\n";
+
+        file_put_contents($log_file, $log_entry, FILE_APPEND | LOCK_EX);
+    }
+
+    /**
+     * Санитизация данных для лога (скрываем чувствительную информацию)
+     *
+     * @param array $data Данные для лога
+     * @return array Очищенные данные
+     */
+    private function sanitize_log_data($data) {
+        if (!is_array($data)) {
+            return $data;
+        }
+        
+        $sensitive_keys = array('password', 'userName', 'merchant_login', 'merchant_password', 'PAN', 'CVC', 'cardNumber', 'cardCvc');
+        
+        foreach ($data as $key => $value) {
+            if (in_array($key, $sensitive_keys)) {
+                $data[$key] = '***HIDDEN***';
+            } elseif (is_array($value)) {
+                $data[$key] = $this->sanitize_log_data($value);
+            }
+        }
+        
+        return $data;
+    }
+
+    /**
+     * Тестовое подключение к API
+     *
+     * @return bool Результат проверки подключения
+     */
+    public function test_connection() {
+        try {
+            $request_data = array(
+                'userName'  => $this->gateway->merchant_login,
+                'password'  => $this->gateway->merchant_password
+            );
+            
+            $response = $this->send_request('getOrderStatus.do', $request_data);
+            
+            // Если запрос прошел без исключений, считаем подключение успешным
+            return true;
+            
+        } catch (Exception $e) {
+            // Ловим конкретные ошибки аутентификации
+            if (strpos($e->getMessage(), 'Ошибка аутентификации') !== false ||
+                strpos($e->getMessage(), 'Неверные учетные данные') !== false) {
+                return false;
+            }
+            
+            // Для других ошибок считаем подключение успешным (сервер ответил)
+            return true;
+        }
     }
 }
